@@ -386,7 +386,7 @@ void loop() {
         if (GPS.speed < TEST_SPEED_THRESHOLD_KTS) {
           Serial.println("Switching to STATE_LANDED_1");
           nAppState = STATE_LANDED_1;
-          timer1_ms = curTime_ms + TIMER1_INTERVAL_MS;
+          timer1_ms = TIMER1_INTERVAL_MS;
         }
       }
       break;
@@ -474,7 +474,7 @@ void loop() {
     }
     else {
       bBatteryAlarm = false;
-      setBlinkState( (nAppState != STATE_WAIT) ? BLINK_STATE_LOGGING : BLINK_STATE_OFF);
+      setBlinkState( (nAppState != STATE_WAIT) ? BLINK_STATE_LOGGING : BLINK_STATE_OFF );
     }
 
     /*
