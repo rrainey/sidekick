@@ -88,10 +88,14 @@ bool mpu6050Present = false;
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 
-#define VBATPIN A7
-#define RED_LED 13
-
-// SD device value; needed for Adafruit Adalogger M0
+/*
+ * Adalogger M0 hardware definitions
+ * 
+ * See https://learn.adafruit.com/adafruit-feather-m0-adalogger/pinouts
+ */
+#define VBATPIN       A7
+#define RED_LED       13
+#define GREEN_SD_LED   8
 #define SD_CHIP_SELECT 4
 
 #define GPSSerial Serial1
@@ -356,10 +360,12 @@ void loop() {
         logFile.println( NMEA_APP_STRING );
         
         logFile.print( lastNMEA );
+
+        logFile.flush();
  
         // log data; jump to 5HZ logging
-        GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
-        GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
+        //GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
+        //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
 
         // Activate altitude / battery sensor logging
         bTimer4Active = true;
@@ -468,30 +474,31 @@ void loop() {
 
     if ( measuredBattery_volts <= LOWBATT_THRESHOLD ) {
       bBatteryAlarm = true;
-       if (! bTimer3Active) {
-          setBlinkState ( BLINK_STATE_BATTERY );
-       }
+      setBlinkState ( BLINK_STATE_BATTERY );
     }
     else {
-      bBatteryAlarm = false;
-      setBlinkState( (nAppState != STATE_WAIT) ? BLINK_STATE_LOGGING : BLINK_STATE_OFF );
-    }
-
-    /*
-     * RED LED Blink Logic
-     * 
-     * The RED LED will blink using different patterns to indicate
-     * one of three states: Constant off, ON/OFF at 1.5Hz to indicates a low battery.
-     * A 3-second blink is used to indicate flight mode.
-     */
-    if (bTimer3Active && timer3_ms <= 0) {
-      redLEDState = (redLEDState == HIGH) ? LOW: HIGH;
-      digitalWrite(RED_LED, redLEDState);
-      timer3_ms = TIMER3_OFF_INTERVAL_1_MS;
-      if (!bBatteryAlarm && redLEDState == LOW) {
-        timer3_ms = TIMER3_OFF_INTERVAL_2_MS;
+      if ( bBatteryAlarm ) {
+        setBlinkState( (nAppState != STATE_WAIT) ? BLINK_STATE_LOGGING : BLINK_STATE_OFF );
       }
+      bBatteryAlarm = false;
     }
+  }
+
+  /*
+   * RED LED Blink Logic
+   * 
+   * The RED LED will blink using different patterns to indicate
+   * one of three states: Constant off, ON/OFF at 1.5Hz to indicates a low battery.
+   * A 3-second blink is used to indicate flight mode.
+   */
+  if (bTimer3Active && timer3_ms <= 0) {
+    redLEDState = (redLEDState == HIGH) ? LOW: HIGH;
+    digitalWrite(RED_LED, redLEDState);
+    timer3_ms = TIMER3_OFF_INTERVAL_1_MS;
+    if (!bBatteryAlarm && redLEDState == LOW) {
+      timer3_ms = TIMER3_OFF_INTERVAL_2_MS;
+    }
+    
   }
 
   /*
