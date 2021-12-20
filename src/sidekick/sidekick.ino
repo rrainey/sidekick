@@ -1,3 +1,20 @@
+/* 
+ * This file is part of the Kick distribution (https://github.com/rrainey/sidekick
+ * Copyright (c) 2021 Riley Rainey
+ * 
+ * This program is free software: you can redistribute it and/or modify  
+ * it under the terms of the GNU General Public License as published by  
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but 
+ * WITHOUT ANY WARRANTY; without even the implied warranty of 
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License 
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 #include <Adafruit_BME680.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -5,9 +22,9 @@
 #include <SPI.h>
 #include <SD.h>
 
-#define APP_STRING  "Sidekick, version 0.1"
+#define APP_STRING  "Sidekick, version 0.11"
 #define LOG_VERSION 1
-#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.1\",1"
+#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.11\",1"
 
 /*
  * Operating mode
@@ -47,7 +64,7 @@ int nAppState;
 #define BLINK_STATE_LOGGING 1
 #define BLINK_STATE_BATTERY 2
 
-int blinkState;
+int blinkState = BLINK_STATE_OFF;
 
 bool bBatteryAlarm = false;
 float measuredBattery_volts;
@@ -112,118 +129,132 @@ Adafruit_GPS GPS(&GPSSerial);
  */
 uint32_t lastTime_ms = 0;
 
+/*
+ * Set up timers
+ * 
+ * Timer 1: used in landing state machine (OFF initially)
+ * 
+ * Timer 2: periodic check of battery state
+ * 
+ * Timer 3: blink controller for RED LED  (OFF initially)
+ * 
+ * Timer 4: BME sensor logging interval timer  (OFF initially)
+ * 
+ * Timer 5: Periodic SD-card log file flushing  (OFF initially)
+ */
+
 #define TIMER1_INTERVAL_MS 60000
 
 bool bTimer1Active = false;
-uint32_t timer1_ms = 0;
+int32_t timer1_ms = 0;
 
 #define TIMER2_INTERVAL_MS 30000
 
-bool bTimer2Active = false;
-uint32_t timer2_ms = 0;
+bool bTimer2Active = true;
+int32_t timer2_ms = TIMER2_INTERVAL_MS;
 
 #define TIMER3_ON_INTERVAL_MS     750
 #define TIMER3_OFF_INTERVAL_1_MS  750 // off interval when signaling battery low
 #define TIMER3_OFF_INTERVAL_2_MS  (3000 - TIMER3_ON_INTERVAL_MS) // off interval for flight mode
 
 bool bTimer3Active = false;
-uint32_t timer3_ms = 0;
+int32_t timer3_ms = 0;
 
 #define TIMER4_INTERVAL_MS 200
 
 bool bTimer4Active = false;
-uint32_t timer4_ms = 0;
+int32_t timer4_ms = 0;
 
 #define TIMER5_INTERVAL_MS 10000
 
 bool bTimer5Active = false;
-uint32_t timer5_ms = 0;
+int32_t timer5_ms = 0;
 
 int redLEDState = LOW;
 
+// For debugging
 bool printNMEA = false;
 
+/**
+ * Control RED (blinking) LED
+ * This LED is locted to the left of the USB connector on
+ * the Adalogger
+ */
 void setBlinkState( int newState ) {
 
-  if ( blinkState == BLINK_STATE_OFF ) {
+  switch ( blinkState ) {
+
+  case BLINK_STATE_OFF:
+    // Was off, now on?
     if (newState != BLINK_STATE_OFF ) {
-      blinkState = newState;
       bTimer3Active = true;
       timer3_ms = TIMER3_ON_INTERVAL_MS;
       redLEDState = HIGH;
-      digitalWrite(RED_LED, redLEDState);
     }
-  }
-  else if ( blinkState == BLINK_STATE_LOGGING ) {
+    break;
+    
+  case BLINK_STATE_LOGGING:
     if (newState == BLINK_STATE_BATTERY) {
-      blinkState = newState;
       bTimer3Active = true;
       timer3_ms = TIMER3_ON_INTERVAL_MS;
       redLEDState = HIGH;
-      digitalWrite(RED_LED, redLEDState);
     }
     else if (newState == BLINK_STATE_OFF) {
-        blinkState = newState;
         bTimer3Active = false;
         redLEDState = LOW;
-        digitalWrite(RED_LED, redLEDState);
      }
-  }
-  else if ( blinkState == BLINK_STATE_BATTERY ) {
+     break;
+     
+  case BLINK_STATE_BATTERY:
     if (newState == BLINK_STATE_OFF) {
-      bTimer3Active = true;
+      bTimer3Active = false;
       redLEDState = LOW;
-      digitalWrite(RED_LED, redLEDState);
     }
     else {
-      // change state, but let blinking logic handle the transition
-      blinkState = newState;
+      // update state, but let blinking logic handle the transition
     }
+    break;
   }
+
+  // Update state and LED
+  blinkState = newState;
+  digitalWrite( RED_LED, redLEDState );
 }
 
 char * generateLogname(char *gname) 
 {
-    char name[128];
+    char * result = NULL;
     int i;
     for (i=0; true; i++) {
-      sprintf (name, "log%05d.txt", i);
+      sprintf (gname, "log%05d.txt", i);
    
-      if (!SD.exists(name)) {
-          strcpy(gname, name);
-          return gname;
+      if (!SD.exists(gname)) {
+          result = gname;
+          break;
       }
     }
 
-    return NULL;
+    return result;
 }
 
 void setup() {
 
   blinkState = BLINK_STATE_OFF;
-
-  lastTime_ms = millis();
-
-  /*
-   * Set up timers
-   * 
-   * Timer 1: used in landing state machine
-   * 
-   * Timer 2: periodic check of battery state
-   * 
-   * Timer 3: blink controller for RED LED
-   * 
-   * Timer 4: BME sensor logging interval timer
-   */
   
-  bTimer2Active = true;
-  timer2_ms = TIMER2_INTERVAL_MS;
+  //bTimer2Active = true;
+  //timer2_ms = TIMER2_INTERVAL_MS;
 
   pinMode(RED_LED, OUTPUT);
   digitalWrite(RED_LED, LOW);
 
-  // wait for hardware serial to appear
-  while (!Serial);
+  lastTime_ms = millis();
+
+  // Wait (maximim of 30 seconds) for hardware serial to appear
+  while (!Serial) {
+    if (millis() - lastTime_ms > 30000) {
+      break;
+    }
+  }
   
   Serial.begin(115200);
 
@@ -280,9 +311,42 @@ void setup() {
 
   Serial.println("Switching to STATE_WAIT");
   nAppState = STATE_WAIT;
-  
-}
 
+  /*
+   * Set to 'true' do do some quick debugging of landing flow.
+   */
+  if (false) {
+    Serial.println("Switching to STATE_IN_FLIGHT");
+        
+    // open log file
+    generateLogname( logpath );
+    logFile = SD.open( logpath, FILE_WRITE );
+
+    logFile.println( NMEA_APP_STRING );
+    
+    //logFile.print( lastNMEA );
+
+    logFile.flush();
+
+    // log data; jump to 5HZ logging
+    //GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
+    //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
+
+    // Activate altitude / battery sensor logging
+    bTimer4Active = true;
+    timer4_ms = TIMER4_INTERVAL_MS;
+
+    // Activate periodic log file flushing
+    startLogFileFlushing();
+
+    // Activate "in flight" LED blinking
+    setBlinkState ( BLINK_STATE_LOGGING );
+    
+    nAppState = STATE_IN_FLIGHT;
+  }
+  
+  lastTime_ms = millis();
+}
 
 void loop() {
   
@@ -314,6 +378,8 @@ void loop() {
     if (bTimer5Active) {
       timer5_ms -= deltaTime_ms;
     }
+    
+    lastTime_ms = curTime_ms;
 
   }
   
@@ -372,8 +438,7 @@ void loop() {
         timer4_ms = TIMER4_INTERVAL_MS;
 
         // Activate periodic log file flushing
-        bTimer5Active = true;
-        timer5_ms = TIMER5_INTERVAL_MS;
+        startLogFileFlushing();
 
         // Activate "in flight" LED blinking
         setBlinkState ( BLINK_STATE_LOGGING );
@@ -393,6 +458,7 @@ void loop() {
           Serial.println("Switching to STATE_LANDED_1");
           nAppState = STATE_LANDED_1;
           timer1_ms = TIMER1_INTERVAL_MS;
+          bTimer1Active = true;
         }
       }
       break;
@@ -410,15 +476,15 @@ void loop() {
           bTimer1Active = false;
         }
         else if (bTimer1Active && timer1_ms <= 0) {
-          GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
-          GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+          //GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+          //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
           bTimer4Active = false;
           logFile.close();
           Serial.println("Switching to STATE_WAIT");
           setBlinkState ( BLINK_STATE_OFF );
           nAppState = STATE_WAIT;
           bTimer1Active = false;
-          bTimer5Active = false;
+          stopLogFileFlushing();
           
         }
         
@@ -432,7 +498,7 @@ void loop() {
 
         flushLog();
         
-        if (GPS.speed >= 7.0) {
+        if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
           nAppState = STATE_IN_FLIGHT;
           bTimer1Active = false;
         }
@@ -460,6 +526,27 @@ void loop() {
    */
 
   /*
+   * RED LED Blink Logic
+   * 
+   * The RED LED will blink using different patterns to indicate
+   * one of three states: Constant off, ON/OFF at 1.5Hz to indicates a low battery.
+   * A 3-second blink is used to indicate flight mode.
+   */
+  if (bTimer3Active && timer3_ms <= 0) {
+    
+    redLEDState = (redLEDState == HIGH) ? LOW : HIGH;
+    digitalWrite(RED_LED, redLEDState);
+
+    if ( redLEDState == HIGH ) {
+      timer3_ms = TIMER3_ON_INTERVAL_MS;
+    }
+    else {
+      timer3_ms = (bBatteryAlarm) ? TIMER3_OFF_INTERVAL_1_MS : TIMER3_OFF_INTERVAL_2_MS;
+    }
+    
+  }
+
+  /*
    * Every 30 seconds, measure the battery state.
    * Blink red LED if low.
    */
@@ -485,23 +572,6 @@ void loop() {
   }
 
   /*
-   * RED LED Blink Logic
-   * 
-   * The RED LED will blink using different patterns to indicate
-   * one of three states: Constant off, ON/OFF at 1.5Hz to indicates a low battery.
-   * A 3-second blink is used to indicate flight mode.
-   */
-  if (bTimer3Active && timer3_ms <= 0) {
-    redLEDState = (redLEDState == HIGH) ? LOW: HIGH;
-    digitalWrite(RED_LED, redLEDState);
-    timer3_ms = TIMER3_OFF_INTERVAL_1_MS;
-    if (!bBatteryAlarm && redLEDState == LOW) {
-      timer3_ms = TIMER3_OFF_INTERVAL_2_MS;
-    }
-    
-  }
-
-  /*
    * Log BME sensor information
    */
   if (bTimer4Active && timer4_ms <= 0) {
@@ -509,12 +579,6 @@ void loop() {
     BMESample();
 
     timer4_ms = TIMER4_INTERVAL_MS;
-  }
-
-  if ( deltaTime_ms > 0 ) {
-
-    lastTime_ms = curTime_ms;
-
   }
   
 }
@@ -547,17 +611,33 @@ void BMESample() {
   }
 }
 
+void startLogFileFlushing()
+{
+  if (! bTimer5Active) {
+    timer5_ms = TIMER5_INTERVAL_MS;
+    bTimer5Active = true;
+  }
+}
+
+void stopLogFileFlushing()
+{
+  if (bTimer5Active) {
+    timer5_ms = 0;
+    bTimer5Active = false;
+  }
+}
+
 void flushLog() {
-  
-  if ( nAppState != STATE_WAIT ) {
     
-    if (bTimer5Active && timer5_ms <= 0) {
+  if (bTimer5Active && timer5_ms <= 0) {
+    //Serial.println( "Log flushing" );
 
-      if ( logFile ) {
-        logFile.flush();
-      }
+    timer5_ms = TIMER5_INTERVAL_MS;
 
-      timer5_ms = TIMER5_INTERVAL_MS;
+    if ( logFile ) {
+
+      logFile.flush();
     }
+    
   }
 }
