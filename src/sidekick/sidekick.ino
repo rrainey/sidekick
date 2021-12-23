@@ -22,9 +22,9 @@
 #include <SPI.h>
 #include <SD.h>
 
-#define APP_STRING  "Sidekick, version 0.11"
+#define APP_STRING  "Sidekick, version 0.15"
 #define LOG_VERSION 1
-#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.11\",1"
+#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.15\",15,2"
 
 /*
  * Operating mode
@@ -143,7 +143,7 @@ uint32_t lastTime_ms = 0;
  * Timer 5: Periodic SD-card log file flushing  (OFF initially)
  */
 
-#define TIMER1_INTERVAL_MS 60000
+#define TIMER1_INTERVAL_MS 30000
 
 bool bTimer1Active = false;
 int32_t timer1_ms = 0;
@@ -160,7 +160,7 @@ int32_t timer2_ms = TIMER2_INTERVAL_MS;
 bool bTimer3Active = false;
 int32_t timer3_ms = 0;
 
-#define TIMER4_INTERVAL_MS 200
+#define TIMER4_INTERVAL_MS 250
 
 bool bTimer4Active = false;
 int32_t timer4_ms = 0;
@@ -315,7 +315,7 @@ void setup() {
   /*
    * Set to 'true' do do some quick debugging of landing flow.
    */
-  if (false) {
+  if (true) {
     Serial.println("Switching to STATE_IN_FLIGHT");
         
     // open log file
@@ -341,6 +341,9 @@ void setup() {
 
     // Activate "in flight" LED blinking
     setBlinkState ( BLINK_STATE_LOGGING );
+
+    // force battery test timer to fire
+    timer2_ms = 0;
     
     nAppState = STATE_IN_FLIGHT;
   }
@@ -479,12 +482,13 @@ void loop() {
           //GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
           //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
           bTimer4Active = false;
-          logFile.close();
           Serial.println("Switching to STATE_WAIT");
           setBlinkState ( BLINK_STATE_OFF );
           nAppState = STATE_WAIT;
           bTimer1Active = false;
+          
           stopLogFileFlushing();
+          logFile.close();
           
         }
         
@@ -515,7 +519,6 @@ void loop() {
         }
       }
       break;
-
     }
       
   }
@@ -541,7 +544,7 @@ void loop() {
       timer3_ms = TIMER3_ON_INTERVAL_MS;
     }
     else {
-      timer3_ms = (bBatteryAlarm) ? TIMER3_OFF_INTERVAL_1_MS : TIMER3_OFF_INTERVAL_2_MS;
+      timer3_ms = bBatteryAlarm ? TIMER3_OFF_INTERVAL_1_MS : TIMER3_OFF_INTERVAL_2_MS;
     }
     
   }
@@ -554,7 +557,7 @@ void loop() {
     
     timer2_ms = TIMER2_INTERVAL_MS;
     
-    float measuredBattery_volts = analogRead(VBATPIN);
+    measuredBattery_volts = analogRead(VBATPIN);
     measuredBattery_volts *= 2;    // we divided by 2, so multiply back
     measuredBattery_volts *= 3.3;  // Multiply by 3.3V, our reference voltage
     measuredBattery_volts /= 1024; // convert to voltage
@@ -600,7 +603,7 @@ void BMESample() {
       logFile.print(bme.pressure / 100.0);
       logFile.print(",");
       logFile.print(bme.humidity);
-      logFile.println(",");
+      logFile.print(",");
       logFile.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
       logFile.print(",");
       logFile.print(bme.gas_resistance / 1000.0);
@@ -625,17 +628,21 @@ void stopLogFileFlushing()
     timer5_ms = 0;
     bTimer5Active = false;
   }
+
+  if ( logFile ) {
+    logFile.flush();
+  }
 }
 
 void flushLog() {
     
   if (bTimer5Active && timer5_ms <= 0) {
+    
     //Serial.println( "Log flushing" );
 
     timer5_ms = TIMER5_INTERVAL_MS;
 
     if ( logFile ) {
-
       logFile.flush();
     }
     
