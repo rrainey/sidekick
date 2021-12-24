@@ -22,9 +22,17 @@
 #include <SPI.h>
 #include <SD.h>
 
-#define APP_STRING  "Sidekick, version 0.15"
+#define APP_STRING  "Sidekick, version 0.18"
 #define LOG_VERSION 1
-#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.15\",15,2"
+#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.18\",18,3"
+
+/**
+ * Fatal error codes (to be implemented)
+ * 
+ * 1 - no SD card
+ * 2 - altitude sensor fail
+ * 3 - IMU sensor fail
+ */
 
 /*
  * Operating mode
@@ -116,12 +124,11 @@ bool mpu6050Present = false;
 #define SD_CHIP_SELECT 4
 
 #define GPSSerial Serial1
+Adafruit_GPS GPS(&GPSSerial);
 
 File logFile;
 
 char logpath[32];
-
-Adafruit_GPS GPS(&GPSSerial);
 
 /*
  * Records last millis() time when timers were updated in
@@ -237,6 +244,106 @@ char * generateLogname(char *gname)
     return result;
 }
 
+void updateTestStateMachine() {
+
+  /**
+   * State machine appropriate for ground testing
+   * TODO: support flight operating mode, OPS_FLIGHT
+   */
+
+  switch (nAppState) {
+
+  case STATE_WAIT:
+    if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
+
+      Serial.println("Switching to STATE_IN_FLIGHT");
+      
+      // open log file
+      generateLogname( logpath );
+      logFile = SD.open( logpath, FILE_WRITE );
+
+      logFile.println( NMEA_APP_STRING );
+
+      // log data; jump to 5HZ logging
+      //GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
+      //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
+
+      // Activate altitude / battery sensor logging
+      bTimer4Active = true;
+      timer4_ms = TIMER4_INTERVAL_MS;
+
+      // Activate periodic log file flushing
+      startLogFileFlushing();
+
+      // Activate "in flight" LED blinking
+      setBlinkState ( BLINK_STATE_LOGGING );
+      
+      nAppState = STATE_IN_FLIGHT;
+    }
+    break;
+
+  case STATE_IN_FLIGHT:
+    {
+
+      if (GPS.speed < TEST_SPEED_THRESHOLD_KTS) {
+        Serial.println("Switching to STATE_LANDED_1");
+        nAppState = STATE_LANDED_1;
+        timer1_ms = TIMER1_INTERVAL_MS;
+        bTimer1Active = true;
+      }
+    }
+    break;
+
+  case STATE_LANDED_1:
+    {
+
+      if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
+        Serial.println("Switching to STATE_IN_FLIGHT");
+        nAppState = STATE_IN_FLIGHT;
+        bTimer1Active = false;
+      }
+      else if (bTimer1Active && timer1_ms <= 0) {
+        GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+        GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+        bTimer4Active = false;
+        Serial.println("Switching to STATE_WAIT");
+        setBlinkState ( BLINK_STATE_OFF );
+        nAppState = STATE_WAIT;
+        bTimer1Active = false;
+        
+        stopLogFileFlushing();
+        logFile.close();
+        
+      }
+      
+    }
+    break;
+
+  case STATE_LANDED_2:
+    {
+      
+      if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
+        nAppState = STATE_IN_FLIGHT;
+        bTimer1Active = false;
+      }
+      else if (bTimer1Active && timer1_ms <= 0) {
+        GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+        GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+        bTimer4Active = false;
+        setBlinkState ( BLINK_STATE_OFF );
+        nAppState = STATE_WAIT;
+        Serial.println("Switching to STATE_WAIT");
+        bTimer1Active = false;
+        bTimer5Active = false;
+
+        stopLogFileFlushing();
+        logFile.close();
+      }
+    }
+    break;
+  }
+}
+
 void setup() {
 
   blinkState = BLINK_STATE_OFF;
@@ -261,9 +368,9 @@ void setup() {
   Serial.println(APP_STRING);
   
   // 9600 baud is the default rate for the GPS
-  GPSSerial.begin(9600);
+  GPS.begin(9600);
 
-  //GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGAGSA);
 
   // For test operating mode, set update rate to 1HZ
   GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
@@ -315,7 +422,8 @@ void setup() {
   /*
    * Set to 'true' do do some quick debugging of landing flow.
    */
-  if (true) {
+  if (false) {
+    Serial.println("Executing dummy flight run");
     Serial.println("Switching to STATE_IN_FLIGHT");
         
     // open log file
@@ -323,8 +431,6 @@ void setup() {
     logFile = SD.open( logpath, FILE_WRITE );
 
     logFile.println( NMEA_APP_STRING );
-    
-    //logFile.print( lastNMEA );
 
     logFile.flush();
 
@@ -352,6 +458,8 @@ void setup() {
 }
 
 void loop() {
+
+  char lastNMEA[MAXLINELENGTH];
   
   uint32_t curTime_ms = millis();
 
@@ -385,148 +493,46 @@ void loop() {
     lastTime_ms = curTime_ms;
 
   }
+
+  while ( GPS.available() > 0 ) {
   
-  char c = GPS.read();
-
-  /*
-   * Received a NMEA record terminator?  Process it.
-   */
-  if ( GPS.newNMEAreceived() ) {
-
-    char lastNMEA[MAXLINELENGTH];
-
-    strcpy( lastNMEA, GPS.lastNMEA() );
-
-    if ( printNMEA ) {
-      Serial.print( lastNMEA );
-    }
-
+    char c = GPS.read();
+  
     /*
-     * Parse this latest arriving NMEA record. This will update appropriate state
-     * variables in the GPS object. Calling GPS.lastNMEA() also has the effect of clearing the
-     * flag indicating a new record arrived.
+     * Received a NMEA record terminator?  Process it.
      */
-    if (!GPS.parse( lastNMEA )) {
-      // message not useful to us, or (less likely) had invalid checksum
+    if ( GPS.newNMEAreceived() ) {
+  
+      strcpy( lastNMEA, GPS.lastNMEA() );
+
+      if (logFile) {
+        logFile.print( lastNMEA );
+        flushLog();
+      }
+  
+      if ( printNMEA ) {
+        Serial.print( lastNMEA );
+      }
+  
+      /*
+       * Parse this latest arriving NMEA record. This will update appropriate state
+       * variables in the GPS object. Calling GPS.lastNMEA() also has the effect of clearing the
+       * flag indicating a new record arrived.
+       */
+      if (!GPS.parse( lastNMEA )) {
+        // message not useful to us, or (less likely) had invalid checksum
+      }
+  
     }
 
-    /**
-     * State machine appropriate for ground testing
-     * TODO: support flight operating mode, OPS_FLIGHT
-     */
-
-    switch (nAppState) {
-
-    case STATE_WAIT:
-      if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
-
-        Serial.println("Switching to STATE_IN_FLIGHT");
-        
-        // open log file
-        generateLogname( logpath );
-        logFile = SD.open( logpath, FILE_WRITE );
-
-        logFile.println( NMEA_APP_STRING );
-        
-        logFile.print( lastNMEA );
-
-        logFile.flush();
- 
-        // log data; jump to 5HZ logging
-        //GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
-        //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
-
-        // Activate altitude / battery sensor logging
-        bTimer4Active = true;
-        timer4_ms = TIMER4_INTERVAL_MS;
-
-        // Activate periodic log file flushing
-        startLogFileFlushing();
-
-        // Activate "in flight" LED blinking
-        setBlinkState ( BLINK_STATE_LOGGING );
-        
-        nAppState = STATE_IN_FLIGHT;
-      }
-      break;
-
-    case STATE_IN_FLIGHT:
-      {
-        // log NMEA string
-        logFile.print( lastNMEA );
-
-        flushLog();
-
-        if (GPS.speed < TEST_SPEED_THRESHOLD_KTS) {
-          Serial.println("Switching to STATE_LANDED_1");
-          nAppState = STATE_LANDED_1;
-          timer1_ms = TIMER1_INTERVAL_MS;
-          bTimer1Active = true;
-        }
-      }
-      break;
-
-    case STATE_LANDED_1:
-      {
-        // log NMEA string
-        logFile.print( lastNMEA );
-
-        flushLog();
-
-        if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
-          Serial.println("Switching to STATE_IN_FLIGHT");
-          nAppState = STATE_IN_FLIGHT;
-          bTimer1Active = false;
-        }
-        else if (bTimer1Active && timer1_ms <= 0) {
-          //GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
-          //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-          bTimer4Active = false;
-          Serial.println("Switching to STATE_WAIT");
-          setBlinkState ( BLINK_STATE_OFF );
-          nAppState = STATE_WAIT;
-          bTimer1Active = false;
-          
-          stopLogFileFlushing();
-          logFile.close();
-          
-        }
-        
-      }
-      break;
-
-    case STATE_LANDED_2:
-      {
-        // log NMEA string
-        logFile.print( lastNMEA );
-
-        flushLog();
-        
-        if (GPS.speed >= TEST_SPEED_THRESHOLD_KTS) {
-          nAppState = STATE_IN_FLIGHT;
-          bTimer1Active = false;
-        }
-        else if (bTimer1Active && timer1_ms <= 0) {
-          GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
-          GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-          bTimer4Active = false;
-          logFile.close();
-          setBlinkState ( BLINK_STATE_OFF );
-          nAppState = STATE_WAIT;
-          Serial.println("Switching to STATE_WAIT");
-          bTimer1Active = false;
-          bTimer5Active = false;
-        }
-      }
-      break;
-    }
-      
   }
 
   /*
    * Processing tasks below are outside of the
    * GPS NMEA processing loop.
    */
+
+   updateTestStateMachine();
 
   /*
    * RED LED Blink Logic
@@ -598,6 +604,8 @@ void BMESample() {
     if (logFile ) {
     
       logFile.print("$PENV,");
+      logFile.print(millis());
+      logFile.print(",");
       logFile.print(bme.temperature);
       logFile.print(",");
       logFile.print(bme.pressure / 100.0);
