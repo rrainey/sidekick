@@ -1,6 +1,15 @@
 /* 
  * This file is part of the Kick distribution (https://github.com/rrainey/sidekick
- * Copyright (c) 2021 Riley Rainey
+ * Copyright (c) 2022 Riley Rainey
+ * 
+ * Designed for use with the Sidkick prototype package which includes:
+ * 
+ *   Adafruit Adalogger (Feather M0 + SD Card slot)
+ *   Adafruit Uliplate GPS Feather
+ *   DPS310 pressure/temp. sensor board
+ *   MPU6050 IMU sensor board
+ *   
+ * The SD card contents are exposed as a USB Drive using the TinyUSB library.
  * 
  * This program is free software: you can redistribute it and/or modify  
  * it under the terms of the GNU General Public License as published by  
@@ -15,19 +24,49 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <Adafruit_BME680.h>
+#include <SPI.h>
+#include <SDPlus.h>
+#include <Adafruit_TinyUSB.h>
+
+//#include <Adafruit_BME680.h>
+#include <Adafruit_DPS310.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_GPS.h>
-#include <SPI.h>
-#include <SD.h>
 
-#define APP_STRING  "Sidekick, version 0.18"
-#define LOG_VERSION 1
-#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.18\",18,3"
+Adafruit_USBD_MSC usb_msc;
 
 /**
- * Fatal error codes (to be implemented)
+ * Driver status: IMU sensor reports use factory calibration only. Not using IMU sensor FIFO.
+ * 
+ * Last IMU_zero reults on my prototype:
+ * 
+ * averaging 10000 readings each time
+ * .................... [-690,-689] --> [0,3] [-1968,-1966] --> [0,19]  [1255,1257] --> [16376,16391] [129,130] --> [0,3] [29,30] --> [-1,2]  [-1,0] --> [-4,10]
+ * ....................  XAccel      YAccel        ZAccel      XGyro     YGyro     ZGyro
+ * [-690,-690] --> [0,5]  [-1967,-1966] --> [0,19]  [1255,1256] --> [16376,16395] [129,130] --> [0,3] [29,30] --> [-1,2]  [-1,0] --> [-4,10]
+ * .................... [-690,-690] --> [0,7]  [-1967,-1966] --> [0,19]  [1255,1256] --> [16376,16395] [129,130] --> [0,3] [29,30] --> [-2,2]  [-1,0] --> [-4,10]
+ * -------------- done --------------
+ *
+ * For my prototype use these XYZ Gyro rate offsets (rad/sec) in post-processing software: +0.07, +0.02, +0.00
+ */
+
+#define APP_STRING  "Sidekick, version 0.40"
+#define LOG_VERSION 1
+#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.40\",40"
+
+/*
+ * Adalogger M0 hardware definitions
+ * 
+ * See https://learn.adafruit.com/adafruit-feather-m0-adalogger/pinouts
+ */
+#define VBATPIN       A7
+#define RED_LED       13
+#define GREEN_SD_LED   8
+#define SD_CHIP_SELECT 4
+
+/**
+ * Fatal blinking light error codes (to be implemented)
  * 
  * 1 - no SD card
  * 2 - altitude sensor fail
@@ -37,28 +76,30 @@
 /*
  * Operating mode
  */
-#define OPS_FLIGHT       0 // normal mode (NOT YET IMPLEMENTED)
+#define OPS_FLIGHT       0 // normal mode
 #define OPS_GROUND_TEST  1 // for testing; uses horizontal movement as an analogue to altitude changes
 
-int nOpMode = OPS_GROUND_TEST;
+int nOpMode = OPS_FLIGHT;
 
-#define TEST_SPEED_THRESHOLD_KTS  6.0
+#define TEST_SPEED_THRESHOLD_KTS     6.0
+#define OPS_HDOT_THRESHOLD_FPM       300
+#define OPS_HDOT_LAND_THRESHOLD_FPM  100
 
 /*
  * Automatic jump logging
  * Generate a unique log file for each jump.
  * Log file contains GPS NMEA CSV records along with extra sensor data records in quasi-NMEA format
  * 
- * State 0: WAIT - gather baseline surface elevation information; compute HDOT_fps
+ * State 0: WAIT - estimate baseline surface elevation information; compute HDOT_fps
  * 
- * State 1: IN_FLIGHT (enter this state when HDOT_fpm indicates >= 200 fpm climb), 
+ * State 1: IN_FLIGHT (enter this state when HDOT_fpm indicates >= 300 fpm climb), 
  *                   enable GPS (future versions), compute HDOT_fps, start logging if not already)
  *                   
  * State 2: LANDED1 (enter when altitude is within 1000 feet of baseline ground alt and 
- *                   HDOT_fpm < 50 fpm, start timer 1, log data)
+ *                   HDOT_fpm < 100 fpm, start timer 1, log data), log data
  *                   
- * State 3: LANDED2  like state 2 - if any conditions are vioated, return to state 1(IN_FLIGHT), 
- *                   go to state 0 when timer 1 reaches 60 seconds, disable GPS (future versions), log data otherwise
+ * State 3: LANDED2  like state LANDED1 - if any conditions are violated, return to IN_FLIGHT state, 
+ *                   go to WAIT state when timer 1 reaches 60 seconds, disable GPS (future versions), log data otherwise
  */
 
 #define STATE_WAIT       0
@@ -88,21 +129,68 @@ float measuredBattery_volts;
 int nH_feet = 0;
 
 /*
- * Estimated rate of climb (fps)
+ * Estimated rate of climb (fpm)
  */
-int nHDOT_fps = 0;
+int nHDot_fpm = 0;
 
 /*
  * Estimated ground elevation, ft
  * 
- * Computed while in WAIT state.
+ * Estimated by sampling altitude while in WAIT state.
  */
 int nHGround_feet = 0;
+
+#define NUM_H_SAMPLES 5
+int nHSample[NUM_H_SAMPLES];
+int nHDotSample[NUM_H_SAMPLES];
+int nNextHSample = 0;
+uint32_t ulLastHSampleMillis;
+
+/**
+ * Currently unused.
+ */
+int computAvgHDot() {
+  int i;
+  int sum;
+  for(i=0; i<NUM_H_SAMPLES; ++i) {
+    sum += nHDotSample[i];
+  }
+  return sum / 5;
+}
+
+/**
+ * Use periodic pressure altitude samples to estimate rate of climb.
+ */
+void updateHDot(float H_feet) {
+
+  uint32_t ulMillis = millis();
+  int nLastHSample_feet;
+  int nInterval_ms = ulLastHSampleMillis - ulMillis;
+
+  /* update HDot every ten seconds */
+  if (nInterval_ms > 10000) {
+    if (nNextHSample == 0) {
+      nLastHSample_feet = nHSample[NUM_H_SAMPLES-1];
+    }
+    else {
+      nLastHSample_feet = nHSample[nNextHSample-1];
+    }
+    nHSample[nNextHSample] = H_feet;
+    nHDotSample[nNextHSample] = (((long) H_feet - nLastHSample_feet) * 60000L) / nInterval_ms;
+
+    nHDot_fpm = nHDotSample[nNextHSample];
+  
+    ulLastHSampleMillis = ulMillis;
+    if (++nNextHSample >= NUM_H_SAMPLES) {
+      nNextHSample = 0;
+    }
+  }
+}
 
 /*
  * I2C connection to the BME688 pressure/temp sensor
  */
-Adafruit_BME680 bme;
+//Adafruit_BME680 bme;
 
 /*
  * I2C connection to the MPU-6050 IMU
@@ -113,15 +201,9 @@ bool mpu6050Present = false;
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 
-/*
- * Adalogger M0 hardware definitions
- * 
- * See https://learn.adafruit.com/adafruit-feather-m0-adalogger/pinouts
- */
-#define VBATPIN       A7
-#define RED_LED       13
-#define GREEN_SD_LED   8
-#define SD_CHIP_SELECT 4
+Adafruit_DPS310 dps;
+Adafruit_Sensor *dps_temp = dps.getTemperatureSensor();
+Adafruit_Sensor *dps_pressure = dps.getPressureSensor();
 
 #define GPSSerial Serial1
 Adafruit_GPS GPS(&GPSSerial);
@@ -167,7 +249,7 @@ int32_t timer2_ms = TIMER2_INTERVAL_MS;
 bool bTimer3Active = false;
 int32_t timer3_ms = 0;
 
-#define TIMER4_INTERVAL_MS 250
+#define TIMER4_INTERVAL_MS 25  // 40Hz
 
 bool bTimer4Active = false;
 int32_t timer4_ms = 0;
@@ -344,6 +426,107 @@ void updateTestStateMachine() {
   }
 }
 
+void updateFlightStateMachine() {
+
+  /**
+   * State machine appropriate for ground testing
+   * TODO: support flight operating mode, OPS_FLIGHT
+   */
+
+  switch (nAppState) {
+
+  case STATE_WAIT:
+    if (nHDot_fpm > OPS_HDOT_THRESHOLD_FPM) {
+
+      Serial.println("Switching to STATE_IN_FLIGHT");
+      
+      // open log file
+      generateLogname( logpath );
+      logFile = SD.open( logpath, FILE_WRITE );
+
+      logFile.println( NMEA_APP_STRING );
+
+      // log data; jump to 5HZ logging
+      //GPS.sendCommand(PMTK_API_SET_FIX_CTL_5HZ);
+      //GPS.sendCommand(PMTK_SET_NMEA_UPDATE_5HZ);
+
+      // Activate altitude / battery sensor logging
+      bTimer4Active = true;
+      timer4_ms = TIMER4_INTERVAL_MS;
+
+      // Activate periodic log file flushing
+      startLogFileFlushing();
+
+      // Activate "in flight" LED blinking
+      setBlinkState ( BLINK_STATE_LOGGING );
+      
+      nAppState = STATE_IN_FLIGHT;
+    }
+    break;
+
+  case STATE_IN_FLIGHT:
+    {
+
+      if (nHDot_fpm <= OPS_HDOT_LAND_THRESHOLD_FPM) {
+        Serial.println("Switching to STATE_LANDED_1");
+        nAppState = STATE_LANDED_1;
+        timer1_ms = TIMER1_INTERVAL_MS;
+        bTimer1Active = true;
+      }
+    }
+    break;
+
+  case STATE_LANDED_1:
+    {
+
+      if (nHDot_fpm >= OPS_HDOT_THRESHOLD_FPM) {
+        Serial.println("Switching to STATE_IN_FLIGHT");
+        nAppState = STATE_IN_FLIGHT;
+        bTimer1Active = false;
+      }
+      else if (bTimer1Active && timer1_ms <= 0) {
+        GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+        GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+        bTimer4Active = false;
+        Serial.println("Switching to STATE_WAIT");
+        setBlinkState ( BLINK_STATE_OFF );
+        nAppState = STATE_WAIT;
+        bTimer1Active = false;
+        
+        stopLogFileFlushing();
+        logFile.close();
+        
+      }
+      
+    }
+    break;
+
+  case STATE_LANDED_2:
+    {
+      
+      if (nHDot_fpm >= OPS_HDOT_THRESHOLD_FPM) {
+        nAppState = STATE_IN_FLIGHT;
+        Serial.println("Switching to STATE_IN_FLIGHT");
+        bTimer1Active = false;
+      }
+      else if (bTimer1Active && timer1_ms <= 0) {
+        GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+        GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+        bTimer4Active = false;
+        setBlinkState ( BLINK_STATE_OFF );
+        nAppState = STATE_WAIT;
+        Serial.println("Switching to STATE_WAIT");
+        bTimer1Active = false;
+        bTimer5Active = false;
+
+        stopLogFileFlushing();
+        logFile.close();
+      }
+    }
+    break;
+  }
+}
+
 void setup() {
 
   blinkState = BLINK_STATE_OFF;
@@ -356,15 +539,16 @@ void setup() {
 
   lastTime_ms = millis();
 
+#ifdef disable_with_tinyUSB
   // Wait (maximim of 30 seconds) for hardware serial to appear
   while (!Serial) {
     if (millis() - lastTime_ms > 30000) {
       break;
     }
   }
-  
-  Serial.begin(115200);
+#endif
 
+  Serial.begin(115200);
   Serial.println(APP_STRING);
   
   // 9600 baud is the default rate for the GPS
@@ -380,22 +564,42 @@ void setup() {
 
   delay(1000);
 
+/*
+
   if (!bme.begin()) {
     Serial.println("Could not find a valid BME680 sensor, check wiring!");
     while (1);
   }
+*/
 
-  if (!SD.begin( SD_CHIP_SELECT )) {
+  delay(500);
+
+  /*
+   * Prepare for USB disk interactions and initialize the SD card interface
+   */
+  usb_msc.setID("Arduino", "SD Card", "1.0");
+  usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
+  usb_msc.setUnitReady(false);
+  usb_msc.begin();
+
+  if ( !SD.begin( SD_CHIP_SELECT ) ) {
 
     Serial.println("SD card initialization failed!");
 
-    while (1);
+    while (1) {
+      delay (10);
+    }
 
   }
 
-  Serial.println("Adafruit MPU6050 test");
+  delay(500);
 
-  if (mpu.begin()) {
+  // Set high-speed I2C clock rate (400K)
+  Wire.setClock( 400000 );
+
+  Serial.println("Initialize I2C peripheral ICs");
+
+  if (mpu.begin(MPU6050_I2CADDR_DEFAULT, &Wire, 1 )) {
     Serial.println("MPU6050 present");
 
     mpu6050Present = true;
@@ -409,10 +613,22 @@ void setup() {
     mpu6050Present = false;
   }
 
-  
+  delay(500);
+
+  if (! dps.begin_I2C(DPS310_I2CADDR_DEFAULT, &Wire)) {
+    Serial.println("Failed to find DPS310 chip");
+    while (1) yield();
+  }
+  Serial.println("DPS310 present");
+
+  dps.configurePressure(DPS310_16HZ, DPS310_16SAMPLES);
+  dps.configureTemperature(DPS310_16HZ, DPS310_16SAMPLES);
+
+  /*
   bme.setTemperatureOversampling(BME680_OS_8X);
   bme.setHumidityOversampling(BME680_OS_2X);
   bme.setPressureOversampling(BME680_OS_4X);
+  */
   //bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
   //bme.setGasHeater(320, 150); // 320*C for 150 ms
 
@@ -420,9 +636,9 @@ void setup() {
   nAppState = STATE_WAIT;
 
   /*
-   * Set to 'true' do do some quick debugging of landing flow.
+   * Set to 'true' to simulate start of flight when board resets.
    */
-  if (false) {
+  if (true) {
     Serial.println("Executing dummy flight run");
     Serial.println("Switching to STATE_IN_FLIGHT");
         
@@ -455,6 +671,16 @@ void setup() {
   }
   
   lastTime_ms = millis();
+
+  /*
+   * Start USB disk operations
+   */
+  uint32_t block_count = SD.getVolume().blocksPerCluster()*SD.getVolume().clusterCount();
+
+  Serial.print("Volume size (MB):  ");
+  Serial.println((block_count/2) / 1024);
+  usb_msc.setCapacity( block_count, 512 );
+  usb_msc.setUnitReady( true );
 }
 
 void loop() {
@@ -528,11 +754,62 @@ void loop() {
   }
 
   /*
-   * Processing tasks below are outside of the
+   * Processing tasks below outside of the
    * GPS NMEA processing loop.
    */
+   
+  if (nOpMode == OPS_FLIGHT) {
+    updateFlightStateMachine();
+  }
+  else {
+    updateTestStateMachine();
+  }
+  
+   /*
+    * 
+    */
 
-   updateTestStateMachine();
+    sensors_event_t temp_event, pressure_event;
+  
+    if (dps.temperatureAvailable()) {
+      dps_temp->getEvent(&temp_event);
+      /*
+      Serial.print(F("Temperature = "));
+      Serial.print(temp_event.temperature);
+      Serial.println(" *C");
+      Serial.println();
+      */
+    }
+  
+    // Reading pressure also reads temp so don't check pressure
+    // before temp!
+    if (dps.pressureAvailable()) {
+      
+      dps_pressure->getEvent(&pressure_event);
+
+      float alt_m = dps.readAltitude();
+        
+      nHGround_feet = alt_m * 3.28084;
+      updateHDot(nHGround_feet);
+
+      if (nAppState != STATE_WAIT) {
+        
+        logFile.print("$PENV,");
+        logFile.print(millis());
+        logFile.print(",");
+        logFile.print(pressure_event.pressure);
+        logFile.print(",");
+        logFile.print(alt_m);
+        logFile.println();
+ 
+      }
+      else {
+        // When we're in WAIT mode, we can use the altitude
+        // to set ground altitude.
+        nHGround_feet = nHGround_feet;
+      }
+      
+    }
 
   /*
    * RED LED Blink Logic
@@ -585,13 +862,15 @@ void loop() {
    */
   if (bTimer4Active && timer4_ms <= 0) {
  
-    BMESample();
+    //BMESample();
+    IMU();
 
     timer4_ms = TIMER4_INTERVAL_MS;
   }
   
 }
 
+/*
 void BMESample() {
 
   if (nAppState != STATE_WAIT) {
@@ -621,6 +900,39 @@ void BMESample() {
     }
   }
 }
+*/
+
+/*
+void PressureSample() {
+
+  if (nAppState != STATE_WAIT) {
+    
+    if (! bme.performReading()) {
+      Serial.println("Failed to perform BME888 reading :(");
+      return;
+    }
+
+    if (logFile ) {
+    
+      logFile.print("$PENV,");
+      logFile.print(millis());
+      logFile.print(",");
+      logFile.print(bme.temperature);
+      logFile.print(",");
+      logFile.print(bme.pressure / 100.0);
+      logFile.print(",");
+      logFile.print(bme.humidity);
+      logFile.print(",");
+      logFile.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
+      logFile.print(",");
+      logFile.print(bme.gas_resistance / 1000.0);
+      logFile.print(",");
+      logFile.println(measuredBattery_volts);
+
+    }
+  }
+}
+*/
 
 void startLogFileFlushing()
 {
@@ -656,3 +968,75 @@ void flushLog() {
     
   }
 }
+
+void IMU() {
+
+  if (mpu6050Present) {
+    
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    
+/*
+    Serial.print(g.gyro.x);
+    Serial.print(",");
+    Serial.print(g.gyro.y);
+    Serial.print(",");
+    Serial.print(g.gyro.z);
+    Serial.println();
+*/
+  
+    if (logFile) {
+      logFile.print("$PIMU,");
+      logFile.print(millis());
+      
+      logFile.print(",");
+      logFile.print(a.acceleration.x);  // m/s^2
+      logFile.print(",");
+      logFile.print(a.acceleration.y);
+      logFile.print(",");
+      logFile.print(a.acceleration.z);
+      
+      logFile.print(",");
+      logFile.print(g.gyro.x);
+      logFile.print(",");
+      logFile.print(g.gyro.y);
+      logFile.print(",");
+      logFile.print(g.gyro.z);
+      logFile.println();
+    }
+  }
+}
+
+/*
+ * Start of USB Disk callbacks
+ */
+
+// Callback invoked when received READ10 command.
+// Copy disk's data to buffer (up to bufsize) and
+// return number of copied bytes (must be multiple of block size)
+int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize)
+{
+  (void) bufsize;
+  return SD.getCard().readBlock(lba, (uint8_t*) buffer) ? 512 : -1;
+}
+
+// Callback invoked when received WRITE10 command.
+// Process data in buffer to disk's storage and 
+// return number of written bytes (must be multiple of block size)
+int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
+{
+  (void) bufsize;
+  return SD.getCard().writeBlock(lba, buffer) ? 512 : -1;
+}
+
+// Callback invoked when WRITE10 command is completed (status received and accepted by host).
+// used to flush any pending cache.
+void msc_flush_cb (void)
+{
+  // nothing to do
+}
+
+
+/*
+ * End of USB Disk callbacks
+ */
