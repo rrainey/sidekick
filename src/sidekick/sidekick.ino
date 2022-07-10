@@ -43,7 +43,7 @@ Adafruit_USBD_MSC usb_msc;
 /**
  * Driver status: IMU sensor reports use factory calibration only. Not using IMU sensor FIFO.
  * 
- * Last IMU_zero reults on my prototype:
+ * Last IMU_zero results on my prototype:
  * 
  * averaging 10000 readings each time
  * .................... [-690,-689] --> [0,3] [-1968,-1966] --> [0,19]  [1255,1257] --> [16376,16391] [129,130] --> [0,3] [29,30] --> [-1,2]  [-1,0] --> [-4,10]
@@ -52,7 +52,7 @@ Adafruit_USBD_MSC usb_msc;
  * .................... [-690,-690] --> [0,7]  [-1967,-1966] --> [0,19]  [1255,1256] --> [16376,16395] [129,130] --> [0,3] [29,30] --> [-2,2]  [-1,0] --> [-4,10]
  * -------------- done --------------
  *
- * For my prototype use these XYZ Gyro rate offsets (rad/sec) in post-processing software: +0.07, +0.02, +0.00
+ * For my prototype use these XYZ Gyro rate offsets (rad/sec) in post-processing software: +0.07, +0.02, +0.00 ; these are not yet built into the logging code.
  */
 
 #define APP_STRING  "Sidekick, version 0.50"
