@@ -2,14 +2,18 @@
  * This file is part of the Kick distribution (https://github.com/rrainey/sidekick
  * Copyright (c) 2022 Riley Rainey
  * 
- * Designed for use with the Sidkick prototype package which includes:
+ * Designed for use with the Sidkick prototype package which is composed of
  * 
  *   Adafruit Adalogger (Feather M0 + SD Card slot)
- *   Adafruit Uliplate GPS Feather
- *   DPS310 pressure/temp. sensor board
- *   MPU6050 IMU sensor board
+ *   Adafruit Ultimate GPS Featherwing
+ *   Adafruit DPS310 pressure/temp. sensor board
+ *   Adafruit MPU6050 IMU sensor board
  *   
  * The SD card contents are exposed as a USB Drive using the TinyUSB library.
+ * The SDPlus library is a custom version of the Arduino SD library.  It is included in this
+ * repo and must be manually installed as a new library in your Arduino installation to compile.
+ * 
+ * This project mst be compiled as a "Adafruit Feather M0" board with TinyUSB enabled.
  * 
  * This program is free software: you can redistribute it and/or modify  
  * it under the terms of the GNU General Public License as published by  
@@ -51,9 +55,9 @@ Adafruit_USBD_MSC usb_msc;
  * For my prototype use these XYZ Gyro rate offsets (rad/sec) in post-processing software: +0.07, +0.02, +0.00
  */
 
-#define APP_STRING  "Sidekick, version 0.40"
+#define APP_STRING  "Sidekick, version 0.50"
 #define LOG_VERSION 1
-#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.40\",40"
+#define NMEA_APP_STRING "$PVER,\"Sidekick, version 0.50\",50"
 
 /*
  * Adalogger M0 hardware definitions
@@ -74,32 +78,61 @@ Adafruit_USBD_MSC usb_msc;
  */
 
 /*
- * Operating mode
+ * Operating mode is compiled into the binary image.
+ * 
  */
-#define OPS_FLIGHT       0 // normal mode
-#define OPS_GROUND_TEST  1 // for testing; uses horizontal movement as an analogue to altitude changes
+#define OPS_FLIGHT        0  // normal mode; altimeter changes used to detect motion and start/stop logging
+#define OPS_STATIC_TEST   1  // for testing; time based simulation of altitude changes (full test run takes 19 minutes from boot to complete)
+#define OPS_GROUND_TEST   2  // for testing; GPS-tracked horizontal motion replaces altitude changes for log control
 
-int nOpMode = OPS_FLIGHT;
+#define OPS_MODE OPS_FLIGHT
+
+int g_nOpMode = OPS_MODE;
+
+#if (OPS_MODE == OPS_STATIC_TEST) 
+//#include "1976AtmosphericModel.h"
+
+//sim1976AtmosphericModel g_atm;
+
+#endif
+
+void startLogFileFlushing();
+void stopLogFileFlushing();
+void flushLog();
 
 #define TEST_SPEED_THRESHOLD_KTS     6.0
 #define OPS_HDOT_THRESHOLD_FPM       300
 #define OPS_HDOT_LAND_THRESHOLD_FPM  100
 
 /*
- * Automatic jump logging
- * Generate a unique log file for each jump.
- * Log file contains GPS NMEA CSV records along with extra sensor data records in quasi-NMEA format
+ * Minutes to milliseconds
+ */
+#define MINtoMS(x) (x * 60 * 1000)
+
+/*
+ * A fresh log file is automatically started when a jump begins.
+ * In the normal operating mode, this is triggered when the pressure altitude indicates a climb of 300 fpm or greater.
+ * The log file will include data for the climb-out as well as the actual jump - that's maybe something to optimize out
+ * in a future version.
  * 
- * State 0: WAIT - estimate baseline surface elevation information; compute HDOT_fps
+ * Generate a unique log file for each jump.
+ * 
+ * State 0: WAIT - estimate baseline surface elevation; compute HDOT_fps
  * 
  * State 1: IN_FLIGHT (enter this state when HDOT_fpm indicates >= 300 fpm climb), 
  *                   enable GPS (future versions), compute HDOT_fps, start logging if not already)
  *                   
- * State 2: LANDED1 (enter when altitude is within 1000 feet of baseline ground alt and 
- *                   HDOT_fpm < 100 fpm, start timer 1, log data), log data
+ * State 2: LANDED1 (enter when abs(HDOT_fpm) < 100 fpm, start timer 1, log data), log data
  *                   
  * State 3: LANDED2  like state LANDED1 - if any conditions are violated, return to IN_FLIGHT state, 
  *                   go to WAIT state when timer 1 reaches 60 seconds, disable GPS (future versions), log data otherwise
+ *                   
+ * Each log file contains NMEA records along with extra sensor data records in quasi-NMEA format; two extra record types:
+ * 
+ *   $PENV,time_millisec,pressure_hPa,alt_m,battery_volts             // (altitude based on standard day temp/press)
+ *   $PIMU,time_millisec,orix,oriy,oriz,rotx,roty,rotz                // (angles in rads, rates in rad/sec)
+ * 
+ * time_millisec is number of milliseconds since device boot
  */
 
 #define STATE_WAIT       0
@@ -146,6 +179,8 @@ int nHDotSample[NUM_H_SAMPLES];
 int nNextHSample = 0;
 uint32_t ulLastHSampleMillis;
 
+boolean bFirstPressureSample = true;
+
 /**
  * Currently unused.
  */
@@ -159,27 +194,36 @@ int computAvgHDot() {
 }
 
 /**
- * Use periodic pressure altitude samples to estimate rate of climb.
+ * Use pressure altitude samples to estimate rate of climb.
+ * 
+ * Rate of climb is re-estimated every 10 seconds.
  */
 void updateHDot(float H_feet) {
 
   uint32_t ulMillis = millis();
   int nLastHSample_feet;
-  int nInterval_ms = ulLastHSampleMillis - ulMillis;
+  int nInterval_ms =  ulMillis - ulLastHSampleMillis;
 
   /* update HDot every ten seconds */
   if (nInterval_ms > 10000) {
-    if (nNextHSample == 0) {
-      nLastHSample_feet = nHSample[NUM_H_SAMPLES-1];
+    if (!bFirstPressureSample) {
+      if (nNextHSample == 0) {
+        nLastHSample_feet = nHSample[NUM_H_SAMPLES-1];
+      }
+      else {
+        nLastHSample_feet = nHSample[nNextHSample-1];
+      }
+      nHSample[nNextHSample] = H_feet;
+      nHDotSample[nNextHSample] = (((long) H_feet - nLastHSample_feet) * 60000L) / nInterval_ms;
+      nHDot_fpm = nHDotSample[nNextHSample];
     }
     else {
-      nLastHSample_feet = nHSample[nNextHSample-1];
+      bFirstPressureSample = false;
+      nHSample[nNextHSample] = H_feet;
+      nHDotSample[nNextHSample] = 0;
+      nHDot_fpm = 0;
     }
-    nHSample[nNextHSample] = H_feet;
-    nHDotSample[nNextHSample] = (((long) H_feet - nLastHSample_feet) * 60000L) / nInterval_ms;
 
-    nHDot_fpm = nHDotSample[nNextHSample];
-  
     ulLastHSampleMillis = ulMillis;
     if (++nNextHSample >= NUM_H_SAMPLES) {
       nNextHSample = 0;
@@ -209,7 +253,6 @@ Adafruit_Sensor *dps_pressure = dps.getPressureSensor();
 Adafruit_GPS GPS(&GPSSerial);
 
 File logFile;
-
 char logpath[32];
 
 /*
@@ -330,9 +373,7 @@ void updateTestStateMachine() {
 
   /**
    * State machine appropriate for ground testing
-   * TODO: support flight operating mode, OPS_FLIGHT
    */
-
   switch (nAppState) {
 
   case STATE_WAIT:
@@ -429,10 +470,8 @@ void updateTestStateMachine() {
 void updateFlightStateMachine() {
 
   /**
-   * State machine appropriate for ground testing
-   * TODO: support flight operating mode, OPS_FLIGHT
+   * State machine appropriate for flight
    */
-
   switch (nAppState) {
 
   case STATE_WAIT:
@@ -466,8 +505,7 @@ void updateFlightStateMachine() {
 
   case STATE_IN_FLIGHT:
     {
-
-      if (nHDot_fpm <= OPS_HDOT_LAND_THRESHOLD_FPM) {
+      if (labs(nHDot_fpm) <= OPS_HDOT_LAND_THRESHOLD_FPM) {
         Serial.println("Switching to STATE_LANDED_1");
         nAppState = STATE_LANDED_1;
         timer1_ms = TIMER1_INTERVAL_MS;
@@ -479,7 +517,7 @@ void updateFlightStateMachine() {
   case STATE_LANDED_1:
     {
 
-      if (nHDot_fpm >= OPS_HDOT_THRESHOLD_FPM) {
+      if (labs(nHDot_fpm) >= OPS_HDOT_THRESHOLD_FPM) {
         Serial.println("Switching to STATE_IN_FLIGHT");
         nAppState = STATE_IN_FLIGHT;
         bTimer1Active = false;
@@ -492,7 +530,7 @@ void updateFlightStateMachine() {
         setBlinkState ( BLINK_STATE_OFF );
         nAppState = STATE_WAIT;
         bTimer1Active = false;
-        
+
         stopLogFileFlushing();
         logFile.close();
         
@@ -504,7 +542,7 @@ void updateFlightStateMachine() {
   case STATE_LANDED_2:
     {
       
-      if (nHDot_fpm >= OPS_HDOT_THRESHOLD_FPM) {
+      if (labs(nHDot_fpm) >= OPS_HDOT_THRESHOLD_FPM) {
         nAppState = STATE_IN_FLIGHT;
         Serial.println("Switching to STATE_IN_FLIGHT");
         bTimer1Active = false;
@@ -524,6 +562,164 @@ void updateFlightStateMachine() {
       }
     }
     break;
+  }
+}
+
+/*
+ * Start of USB Disk callbacks
+ */
+
+// Callback invoked when received READ10 command.
+// Copy disk's data to buffer (up to bufsize) and
+// return number of copied bytes (must be multiple of block size)
+int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize)
+{
+  (void) bufsize;
+  return SD.getCard().readBlock(lba, (uint8_t*) buffer) ? 512 : -1;
+}
+
+// Callback invoked when received WRITE10 command.
+// Process data in buffer to disk's storage and 
+// return number of written bytes (must be multiple of block size)
+int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
+{
+  (void) bufsize;
+  return SD.getCard().writeBlock(lba, buffer) ? 512 : -1;
+}
+
+// Callback invoked when WRITE10 command is completed (status received and accepted by host).
+// used to flush any pending cache.
+void msc_flush_cb (void)
+{
+  // nothing to do
+}
+
+
+/*
+ * End of USB Disk callbacks
+ */
+
+
+void sampleAndLogAltitude()
+{
+
+  double dAlt_ft;
+  float dPressure_hPa;
+    
+  sensors_event_t temp_event, pressure_event;
+
+  if (dps.temperatureAvailable()) {
+    dps_temp->getEvent(&temp_event);
+    
+    /*
+    Serial.print(F("Temperature = "));
+    Serial.print(temp_event.temperature);
+    Serial.println(" *C");
+    Serial.println();
+    */
+    
+  }
+
+  /*
+   * Note: sampling pressure in dps also samples temperature.
+   */
+  if (dps.pressureAvailable()) {
+
+    dps_pressure->getEvent(&pressure_event);
+
+    dPressure_hPa = pressure_event.pressure;
+
+    if (g_nOpMode != OPS_STATIC_TEST) {
+
+      dAlt_ft = dps.readAltitude() * 3.28084;
+
+    }
+    else {
+      
+      /*
+       * Simulate interpolated altitide based on this schedule:
+       * 
+       * Time (min)     Alt(ft)
+       *     0             600
+       *     2             600
+       *     12           6500
+       *     13           6500
+       *     14           3500
+       *     17            600
+       *     19            600 
+       *     
+       *     Values clamped at finish to last value.
+       */
+
+    struct _vals {
+      float time_ms;
+      int alt_ft;
+    };
+
+    struct _vals *p, *prev;
+    
+    /*
+     * time and altitude readings for a idealized hop-n-pop
+     */
+    static struct _vals table[7] = {
+      { MINtoMS(0),   600 },
+      { MINtoMS(2),   600 },
+      { MINtoMS(12), 6500 },
+      { MINtoMS(13), 6500 },
+      { MINtoMS(13.5), 3500 },
+      { MINtoMS(16.5),  600 },
+      { MINtoMS(19),    600 }
+    };
+
+    static int tableSize = sizeof(table)/sizeof(struct _vals);
+
+     int t = millis();
+
+     if (t >= table[tableSize-1].time_ms || t <= table[0].time_ms ) {
+      dAlt_ft = 600.0;
+     }
+     else {
+        int i;
+        p = &table[0];
+        for (i=1; i<tableSize-1; ++i) {
+          prev = p;
+          p = &table[i];
+  
+          if (t < p->time_ms) {
+            dAlt_ft =  prev->alt_ft + (t - prev->time_ms) * (p->alt_ft - prev->alt_ft) / (p->time_ms - prev->time_ms);
+            break;
+          }
+        }
+     }
+
+      //g_atm.SetConditions( dAlt_ft, 0.0 );
+
+      pressure_event.pressure = 1000.0; //TODO hPA pressure
+    }
+
+    /*
+     * Update based on estimated altitude
+     */
+
+    updateHDot(dAlt_ft);
+    
+    if (nAppState != STATE_WAIT) {
+        
+      logFile.print("$PENV,");
+      logFile.print(millis());
+      logFile.print(",");
+      logFile.print(pressure_event.pressure);
+      logFile.print(",");
+      logFile.print( dAlt_ft );
+      logFile.print(",");
+      logFile.println(measuredBattery_volts);
+    
+    }
+    else {
+      // When we're in WAIT mode, we can use the altitude
+      // to set ground altitude.
+      nHGround_feet = dAlt_ft;
+    }
   }
 }
 
@@ -632,13 +828,26 @@ void setup() {
   //bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
   //bme.setGasHeater(320, 150); // 320*C for 150 ms
 
+  if (g_nOpMode == OPS_STATIC_TEST) {
+    Serial.println("Welcome. The device has booted in OPS_STATIC_TEST mode.");
+    Serial.println("");
+    Serial.println("This test will take about 20 minutes to complete. You will see");
+    Serial.println("state change messages for STATE_WAIT, STATE_IN_FLIGHT, and STATE_LANDED_1. ");
+    Serial.println("The test is complete when the device returns to STATE_WAIT.");
+    Serial.println("You may then inspect the information in the last log file generated.");
+    Serial.println("---");
+  }
+
   Serial.println("Switching to STATE_WAIT");
   nAppState = STATE_WAIT;
 
   /*
    * Set to 'true' to simulate start of flight when board resets.
+   * 
+   * NOTE: not compatible with OPS_STATIC_TEST mode
    */
-  if (true) {
+  if (false && g_nOpMode != OPS_STATIC_TEST) {
+    
     Serial.println("Executing dummy flight run");
     Serial.println("Switching to STATE_IN_FLIGHT");
         
@@ -758,58 +967,18 @@ void loop() {
    * GPS NMEA processing loop.
    */
    
-  if (nOpMode == OPS_FLIGHT) {
+  if (g_nOpMode == OPS_FLIGHT || g_nOpMode == OPS_STATIC_TEST) {
     updateFlightStateMachine();
   }
   else {
     updateTestStateMachine();
   }
   
-   /*
-    * 
-    */
-
-    sensors_event_t temp_event, pressure_event;
-  
-    if (dps.temperatureAvailable()) {
-      dps_temp->getEvent(&temp_event);
-      /*
-      Serial.print(F("Temperature = "));
-      Serial.print(temp_event.temperature);
-      Serial.println(" *C");
-      Serial.println();
-      */
-    }
-  
-    // Reading pressure also reads temp so don't check pressure
-    // before temp!
-    if (dps.pressureAvailable()) {
-      
-      dps_pressure->getEvent(&pressure_event);
-
-      float alt_m = dps.readAltitude();
-        
-      nHGround_feet = alt_m * 3.28084;
-      updateHDot(nHGround_feet);
-
-      if (nAppState != STATE_WAIT) {
-        
-        logFile.print("$PENV,");
-        logFile.print(millis());
-        logFile.print(",");
-        logFile.print(pressure_event.pressure);
-        logFile.print(",");
-        logFile.print(alt_m);
-        logFile.println();
- 
-      }
-      else {
-        // When we're in WAIT mode, we can use the altitude
-        // to set ground altitude.
-        nHGround_feet = nHGround_feet;
-      }
-      
-    }
+ /*
+  * Sample altitide (or simulate altitude changes if we are testing)
+  * Log it.
+  */
+  sampleAndLogAltitude();
 
   /*
    * RED LED Blink Logic
@@ -858,7 +1027,7 @@ void loop() {
   }
 
   /*
-   * Log BME sensor information
+   * Log IMU sensor information
    */
   if (bTimer4Active && timer4_ms <= 0) {
  
@@ -871,6 +1040,10 @@ void loop() {
 }
 
 /*
+ * We are not using a BME IC in this version of Dropkick
+ */
+
+#ifdef NOTDEF
 void BMESample() {
 
   if (nAppState != STATE_WAIT) {
@@ -900,9 +1073,7 @@ void BMESample() {
     }
   }
 }
-*/
 
-/*
 void PressureSample() {
 
   if (nAppState != STATE_WAIT) {
@@ -932,7 +1103,7 @@ void PressureSample() {
     }
   }
 }
-*/
+#endif
 
 void startLogFileFlushing()
 {
@@ -1006,37 +1177,3 @@ void IMU() {
     }
   }
 }
-
-/*
- * Start of USB Disk callbacks
- */
-
-// Callback invoked when received READ10 command.
-// Copy disk's data to buffer (up to bufsize) and
-// return number of copied bytes (must be multiple of block size)
-int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize)
-{
-  (void) bufsize;
-  return SD.getCard().readBlock(lba, (uint8_t*) buffer) ? 512 : -1;
-}
-
-// Callback invoked when received WRITE10 command.
-// Process data in buffer to disk's storage and 
-// return number of written bytes (must be multiple of block size)
-int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
-{
-  (void) bufsize;
-  return SD.getCard().writeBlock(lba, buffer) ? 512 : -1;
-}
-
-// Callback invoked when WRITE10 command is completed (status received and accepted by host).
-// used to flush any pending cache.
-void msc_flush_cb (void)
-{
-  // nothing to do
-}
-
-
-/*
- * End of USB Disk callbacks
- */
